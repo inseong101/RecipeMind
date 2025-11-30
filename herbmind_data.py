@@ -43,12 +43,32 @@ def load_and_preprocess(data_dir: str = "KIOM") -> Dict:
         raise FileNotFoundError(f"No CSV files found in {data_dir}")
 
     frames = []
+    # Some KIOM CSVs name the prescription/herb columns differently. Normalize them
+    # so the rest of the pipeline can assume "처방명" and "약재명" are present.
+    column_candidates = [
+        ("처방명", "약재명"),
+        ("처방한글명", "약재한글명"),
+        ("처방한자명", "약재한자명"),
+    ]
+
     for path in all_files:
         df = read_kiom_csv(path)
         df.columns = [str(c).strip() for c in df.columns]
-        if "처방명" not in df.columns or "약재명" not in df.columns:
-            raise ValueError(f"Required columns missing in {path}. Columns: {df.columns}")
-        frames.append(df[["처방명", "약재명"]].copy())
+
+        presc_col = herb_col = None
+        for p_col, h_col in column_candidates:
+            if p_col in df.columns and h_col in df.columns:
+                presc_col, herb_col = p_col, h_col
+                break
+
+        if presc_col is None:
+            expected = [f"{p}/{h}" for p, h in column_candidates]
+            raise ValueError(
+                f"Required columns missing in {path}. Found: {df.columns}. "
+                f"Expected one of {expected}"
+            )
+
+        frames.append(df[[presc_col, herb_col]].rename(columns={presc_col: "처방명", herb_col: "약재명"}))
     merged = pd.concat(frames, ignore_index=True)
     merged["처방명"] = merged["처방명"].astype(str).str.strip()
     merged["약재명"] = merged["약재명"].astype(str).str.strip()
