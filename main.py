@@ -205,7 +205,14 @@ def collect_attention_example(model: HerbMindModel, preprocessed: Dict, device: 
     logits, attn_maps = model(input_ids, mask, return_attn=True)
     probs = torch.softmax(logits, dim=-1)[0]
     top_candidates = torch.topk(probs, k=min(8, probs.shape[0]))
-    cross_attn = attn_maps[-1][0].detach().cpu().numpy()
+    cross_attn = attn_maps[-1]
+    if cross_attn.dim() == 4:
+        # (batch, heads, tgt_len, src_len) -> average heads, select batch 0
+        cross_attn = cross_attn.mean(dim=1)[0]
+    elif cross_attn.dim() == 3:
+        # (batch, tgt_len, src_len) -> select batch 0
+        cross_attn = cross_attn[0]
+    cross_attn = cross_attn.detach().cpu().numpy()
     rows = [id2herb[idx.item()] for idx in top_candidates.indices]
     cols = [id2herb[i] for i in context]
     attn_sub = cross_attn[top_candidates.indices.cpu().numpy()][:, : len(context)]
@@ -384,8 +391,20 @@ def extract_attention_matrix(attn_maps: List[torch.Tensor], context_len: int) ->
     if not attn_maps:
         return np.zeros((context_len, context_len), dtype=np.float32)
     attn = attn_maps[-2] if len(attn_maps) >= 2 else attn_maps[-1]
-    attn_mean = attn.mean(dim=1)[0].detach().cpu().numpy()
-    return attn_mean[:context_len, :context_len]
+    if attn.dim() == 4:
+        # Shape: (batch, heads, tgt_len, src_len) when average_attn_weights=False
+        attn_mean = attn.mean(dim=1)[0]
+    elif attn.dim() == 3:
+        # Shape: (batch, tgt_len, src_len) when attention is already head-averaged
+        attn_mean = attn[0]
+    elif attn.dim() == 2:
+        # Shape: (tgt_len, src_len) if batch/head dimensions were removed upstream
+        attn_mean = attn
+    else:
+        return np.zeros((context_len, context_len), dtype=np.float32)
+
+    attn_np = attn_mean.detach().cpu().numpy()
+    return attn_np[:context_len, :context_len]
 
 
 def accumulate_attention(
