@@ -8,7 +8,9 @@ import torch.nn.functional as F
 class SetAttentionBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1):
         super().__init__()
-        self.mha = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+        self.mha = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, batch_first=True, average_attn_weights=False
+        )
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 2),
             nn.ReLU(),
@@ -19,7 +21,9 @@ class SetAttentionBlock(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-    def forward(self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         attn_output, attn_weights = self.mha(x, x, x, key_padding_mask=padding_mask)
         x = self.norm1(x + attn_output)
         ffn_out = self.ffn(x)
@@ -36,7 +40,9 @@ class HerbMindModel(nn.Module):
         self.blocks = nn.ModuleList(
             [SetAttentionBlock(embed_dim, num_heads=num_heads, dropout=dropout) for _ in range(num_blocks)]
         )
-        self.cross_attn = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=num_heads, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=num_heads, batch_first=True, average_attn_weights=False
+        )
         self.proj = nn.Linear(embed_dim, 1)
 
     def forward(self, input_ids: torch.Tensor, mask: torch.Tensor, return_attn: bool = False):
