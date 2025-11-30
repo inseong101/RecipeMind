@@ -5,19 +5,10 @@ import random
 from datetime import datetime
 from typing import Dict, List
 
-try:
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    PLOTTING_AVAILABLE = True
-except ImportError:  # pragma: no cover - environment fallback
-    plt = None
-    sns = None
-    PLOTTING_AVAILABLE = False
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.manifold import TSNE
 from tqdm import tqdm
 
 from herbmind_data import (
@@ -31,7 +22,13 @@ from herbmind_data import (
 )
 from herbmind_dataset import build_dataloaders
 from model import HerbMindModel
-
+from visualize import (
+    plot_attention_heatmap,
+    plot_length_heatmap,
+    plot_pmi_heatmap,
+    plot_tsne_embeddings,
+    set_korean_font,
+)
 
 RESULT_SUMMARY = os.path.join("results", "summary.json")
 CHECKPOINT_PATH = os.path.join("checkpoints", "herbmind.pt")
@@ -42,8 +39,6 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
 def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
     total_loss = 0.0
@@ -149,8 +144,6 @@ def herb_table(herb_stats: Dict[int, Dict[str, float]], id2herb: Dict[int, str],
 
 
 def save_tables(length_rows: List[Dict], herb_rows: List[Dict]):
-    import pandas as pd
-
     length_df = pd.DataFrame(length_rows)
     herb_df = pd.DataFrame(herb_rows)
     length_df.to_csv(os.path.join("results", "tables", "length_accuracy.csv"), index=False)
@@ -158,95 +151,27 @@ def save_tables(length_rows: List[Dict], herb_rows: List[Dict]):
     return length_df, herb_df
 
 
-def plot_length_heatmap(length_df):
-    if length_df.empty or not PLOTTING_AVAILABLE:
-        return
-    bins = [2, 3, 4, 5, 6, 7, 8, 9, 10, np.inf]
-    labels = ["2", "3", "4", "5", "6", "7", "8", "9", "10+"]
-    length_df["bin"] = pd.cut(length_df["length"], bins=bins, labels=labels, right=False)
-    pivot = length_df.groupby("bin")["top1"].mean().reset_index()
-    plt.figure(figsize=(8, 4))
-    sns.heatmap(pivot.set_index("bin"), annot=True, cmap="YlGnBu", vmin=0, vmax=1)
-    plt.title("Figure A: Accuracy by Prescription Length")
-    plt.ylabel("Length Bin")
-    plt.xlabel("Top-1 Accuracy")
-    plt.tight_layout()
-    plt.savefig(os.path.join("results", "figures", "figure_length_heatmap.png"))
-    plt.close()
-
-
-def plot_frequency_scatter(herb_df):
-    if herb_df.empty or not PLOTTING_AVAILABLE:
-        return
-    plt.figure(figsize=(8, 5))
-    plt.scatter(herb_df["dataset_frequency"], herb_df["top1"], alpha=0.6)
-    plt.xlabel("Herb Frequency")
-    plt.ylabel("Top-1 Accuracy")
-    plt.title("Figure B: Herb Frequency vs Accuracy")
-    plt.tight_layout()
-    plt.savefig(os.path.join("results", "figures", "figure_frequency_scatter.png"))
-    plt.close()
-
-
-def plot_tsne_embeddings(model: HerbMindModel, id2herb: Dict[int, str]):
-    if not PLOTTING_AVAILABLE:
-        return
-    embeddings = model.embed.weight.detach().cpu().numpy()[:-1]  # exclude padding
-    if embeddings.shape[0] < 2:
-        return
-    perplexity = min(30, embeddings.shape[0] - 1)
-    tsne = TSNE(n_components=2, perplexity=perplexity, init="pca", random_state=42)
-    coords = tsne.fit_transform(embeddings)
-    plt.figure(figsize=(8, 6))
-    plt.scatter(coords[:, 0], coords[:, 1], s=10, alpha=0.7)
-    for idx, (x, y) in enumerate(coords):
-        if idx % max(1, embeddings.shape[0] // 50) == 0:
-            plt.text(x, y, id2herb.get(idx, str(idx)), fontsize=6)
-    plt.title("Figure C: t-SNE of Herb Embeddings")
-    plt.tight_layout()
-    plt.savefig(os.path.join("results", "figures", "figure_tsne_embeddings.png"))
-    plt.close()
-
-
-def plot_attention_example(model: HerbMindModel, preprocessed: Dict):
-    if not preprocessed["prescriptions"] or not PLOTTING_AVAILABLE:
-        return
-    device = next(model.parameters()).device
-    example = preprocessed["prescriptions"][0]
+def compute_pmi(preprocessed: Dict) -> np.ndarray:
+    co_matrix = preprocessed["co_matrix"]
     herb2id = preprocessed["herb2id"]
-    id2herb = preprocessed["id2herb"]
-    herb_ids = [herb2id[h] for h in example["herbs"] if h in herb2id]
-    if len(herb_ids) < 2:
-        return
+    herb_counts = preprocessed["herb_counts"]
+    freq = np.zeros(len(herb2id), dtype=np.float64)
+    for herb, idx in herb2id.items():
+        freq[idx] = herb_counts.get(herb, 0)
 
-    sequence = [herb_ids[0]]
-    recommendations = []
-    for _ in range(min(3, len(herb_ids) - 1)):
-        mask = torch.tensor([[1] * len(sequence)], dtype=torch.float, device=device)
-        input_ids = torch.tensor([sequence], dtype=torch.long, device=device)
-        logits, attn_maps = model(input_ids, mask, return_attn=True)
-        probs = torch.softmax(logits, dim=-1)
-        top3 = torch.topk(probs, k=3, dim=-1).indices[0].cpu().numpy()
-        recommendations.append([id2herb.get(i, str(i)) for i in top3])
-        sequence.append(herb_ids[len(sequence)])
-
-    if attn_maps:
-        attn = attn_maps[-1][0].detach().cpu().numpy()
-        plt.figure(figsize=(6, 4))
-        sns.heatmap(attn, cmap="OrRd")
-        plt.xlabel("Key/Value Herbs")
-        plt.ylabel("Query Herbs")
-        plt.title("Figure D: Attention Heatmap")
-        plt.tight_layout()
-        plt.savefig(os.path.join("results", "figures", "figure_attention_heatmap.png"))
-        plt.close()
-
-    table_path = os.path.join("results", "tables", "example_recommendations.csv")
-    import pandas as pd
-
-    pd.DataFrame({"step": list(range(1, len(recommendations) + 1)), "top3": recommendations}).to_csv(
-        table_path, index=False
-    )
+    freq_sum = freq.sum() + 1e-8
+    pair_sum = co_matrix.sum() / 2 + 1e-8
+    pmi = np.zeros_like(co_matrix, dtype=np.float64)
+    for i in range(len(herb2id)):
+        for j in range(len(herb2id)):
+            if i == j:
+                continue
+            p_i = freq[i] / freq_sum
+            p_j = freq[j] / freq_sum
+            p_ij = co_matrix[i, j] / pair_sum if pair_sum > 0 else 0.0
+            if p_ij > 0 and p_i > 0 and p_j > 0:
+                pmi[i, j] = np.log(p_ij / (p_i * p_j))
+    return pmi
 
 
 def save_summary(summary: Dict):
@@ -259,6 +184,27 @@ def load_checkpoint(model: HerbMindModel):
         model.load_state_dict(state)
         return True
     return False
+
+
+def collect_attention_example(model: HerbMindModel, preprocessed: Dict, device: torch.device):
+    example = preprocessed["prescriptions"][0]
+    herb2id = preprocessed["herb2id"]
+    id2herb = preprocessed["id2herb"]
+    herb_ids = [herb2id[h] for h in example["herbs"] if h in herb2id]
+    if len(herb_ids) < 2:
+        return None
+
+    context = herb_ids[:-1][:6]
+    input_ids = torch.tensor([context], dtype=torch.long, device=device)
+    mask = torch.tensor([[1] * len(context)], dtype=torch.float, device=device)
+    logits, attn_maps = model(input_ids, mask, return_attn=True)
+    probs = torch.softmax(logits, dim=-1)[0]
+    top_candidates = torch.topk(probs, k=min(8, probs.shape[0]))
+    cross_attn = attn_maps[-1][0].detach().cpu().numpy()
+    rows = [id2herb[idx.item()] for idx in top_candidates.indices]
+    cols = [id2herb[i] for i in context]
+    attn_sub = cross_attn[top_candidates.indices.cpu().numpy()][:, : len(context)]
+    return attn_sub, rows, cols
 
 
 def main():
@@ -275,6 +221,7 @@ def main():
 
     ensure_dirs()
     set_seed(args.seed)
+    set_korean_font()
 
     preprocessed = load_and_preprocess()
     generate_splits(preprocessed, seed=args.seed)
@@ -318,10 +265,15 @@ def main():
     herb_rows = herb_table(herb_stats, preprocessed["id2herb"], preprocessed["herb_counts"])
     length_df, herb_df = save_tables(length_rows, herb_rows)
 
-    plot_length_heatmap(length_df)
-    plot_frequency_scatter(herb_df)
-    plot_tsne_embeddings(model, preprocessed["id2herb"])
-    plot_attention_example(model, preprocessed)
+    pmi_matrix = compute_pmi(preprocessed)
+    plot_length_heatmap(length_df, os.path.join("results", "figures", "figure_length_heatmap.png"))
+    plot_tsne_embeddings(model, preprocessed["id2herb"], os.path.join("results", "figures", "figure_tsne_embeddings.png"))
+    plot_pmi_heatmap(pmi_matrix, preprocessed["id2herb"], os.path.join("results", "figures", "figure_pmi_heatmap.png"))
+
+    attention_payload = collect_attention_example(model, preprocessed, device)
+    if attention_payload:
+        attn, rows, cols = attention_payload
+        plot_attention_heatmap(attn, rows, cols, os.path.join("results", "figures", "figure_attention_heatmap.png"))
 
     summary = {
         "created_at": datetime.utcnow().isoformat() + "Z",
@@ -334,6 +286,7 @@ def main():
             "test": test_metrics,
         },
         "history": history,
+        "pmi_max": float(np.max(pmi_matrix)) if pmi_matrix.size else 0.0,
     }
     save_summary(summary)
     print("Pipeline completed. Results saved to results/ directory.")

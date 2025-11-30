@@ -30,6 +30,8 @@ def read_kiom_csv(path: str) -> pd.DataFrame:
 
 
 def load_and_preprocess(data_dir: str = "KIOM") -> Dict:
+    """Load all KIOM CSV files, normalize schema, and cache N-1 quiz data."""
+
     ensure_dirs()
     if os.path.exists(PREPROCESSED_PATH):
         return pickle.load(open(PREPROCESSED_PATH, "rb"))
@@ -43,11 +45,9 @@ def load_and_preprocess(data_dir: str = "KIOM") -> Dict:
         raise FileNotFoundError(f"No CSV files found in {data_dir}")
 
     frames = []
-    # Some KIOM CSVs name the prescription/herb columns differently. Normalize them
-    # so the rest of the pipeline can assume "처방명" and "약재명" are present.
     column_candidates = [
-        ("처방명", "약재명"),
         ("처방한글명", "약재한글명"),
+        ("처방명", "약재명"),
         ("처방한자명", "약재한자명"),
     ]
 
@@ -68,25 +68,26 @@ def load_and_preprocess(data_dir: str = "KIOM") -> Dict:
                 f"Expected one of {expected}"
             )
 
-        frames.append(df[[presc_col, herb_col]].rename(columns={presc_col: "처방명", herb_col: "약재명"}))
-    merged = pd.concat(frames, ignore_index=True)
-    merged["처방명"] = merged["처방명"].astype(str).str.strip()
-    merged["약재명"] = merged["약재명"].astype(str).str.strip()
+        frames.append(
+            df[[presc_col, herb_col]].rename(columns={presc_col: "처방한글명", herb_col: "약재한글명"})
+        )
 
-    grouped = merged.groupby("처방명")
+    merged = pd.concat(frames, ignore_index=True)
+    merged["처방한글명"] = merged["처방한글명"].astype(str).str.strip()
+    merged["약재한글명"] = merged["약재한글명"].astype(str).str.strip()
+
+    merged = merged.drop_duplicates(subset=["처방한글명", "약재한글명"])
+
+    grouped = merged.groupby("처방한글명")
     prescriptions: List[Dict] = []
-    herb_counts = merged["약재명"].value_counts().to_dict()
+    herb_counts = merged["약재한글명"].value_counts().to_dict()
     herb2id: Dict[str, int] = {}
 
     for idx, (name, group) in enumerate(grouped):
-        herbs = list(dict.fromkeys(group["약재명"].tolist()))
+        herbs = list(dict.fromkeys(group["약재한글명"].tolist()))
         if len(herbs) < 2:
             continue
-        prescriptions.append({
-            "id": idx,
-            "name": name,
-            "herbs": herbs,
-        })
+        prescriptions.append({"id": idx, "name": name, "herbs": herbs})
         for herb in herbs:
             if herb not in herb2id:
                 herb2id[herb] = len(herb2id)
@@ -95,11 +96,13 @@ def load_and_preprocess(data_dir: str = "KIOM") -> Dict:
         raise ValueError("No valid prescriptions with at least two herbs were found.")
 
     id2herb = {v: k for k, v in herb2id.items()}
+    co_matrix = build_cooccurrence_matrix(prescriptions, herb2id)
     preprocessed = {
         "prescriptions": prescriptions,
         "herb2id": herb2id,
         "id2herb": id2herb,
         "herb_counts": herb_counts,
+        "co_matrix": co_matrix,
     }
     pickle.dump(preprocessed, open(PREPROCESSED_PATH, "wb"))
     return preprocessed
@@ -138,4 +141,15 @@ def generate_splits(preprocessed: Dict, seed: int = 42, test_ratio: float = 0.1,
             )
         )
         pickle.dump(records, open({"train": TRAIN_PATH, "val": VAL_PATH, "test": TEST_PATH}[split_name], "wb"))
+
+
+def build_cooccurrence_matrix(prescriptions: List[Dict], herb2id: Dict[str, int]) -> np.ndarray:
+    size = len(herb2id)
+    matrix = np.zeros((size, size), dtype=np.int64)
+    for presc in prescriptions:
+        herb_ids = [herb2id[h] for h in presc["herbs"] if h in herb2id]
+        for i, j in itertools.combinations(sorted(set(herb_ids)), 2):
+            matrix[i, j] += 1
+            matrix[j, i] += 1
+    return matrix
 
