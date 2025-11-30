@@ -1,12 +1,17 @@
 import argparse
 import json
+import math
 import os
+import pickle
 import random
 from datetime import datetime
-from typing import Dict, List
+from functools import lru_cache
+from typing import Dict, List, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import seaborn as sns
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -207,6 +212,243 @@ def collect_attention_example(model: HerbMindModel, preprocessed: Dict, device: 
     return attn_sub, rows, cols
 
 
+def load_split_prescription_counts() -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for split_name, path in [("train", TRAIN_PATH), ("val", VAL_PATH), ("test", TEST_PATH)]:
+        if not os.path.exists(path):
+            counts[split_name] = 0
+            continue
+        records = pickle.load(open(path, "rb"))
+        ids = {rec[2] for rec in records}
+        counts[split_name] = len(ids)
+    return counts
+
+
+def compute_dataset_stats(preprocessed: Dict) -> pd.DataFrame:
+    prescriptions = preprocessed["prescriptions"]
+    total_presc = len(prescriptions)
+    total_herb_occurrences = sum(len(p["herbs"]) for p in prescriptions)
+    unique_herbs = len(preprocessed["herb2id"])
+    length_counts: Dict[int, int] = {}
+    for p in prescriptions:
+        length_counts[len(p["herbs"])] = length_counts.get(len(p["herbs"]), 0) + 1
+
+    split_counts = load_split_prescription_counts()
+
+    rows = [
+        {"Statistic": "Total prescriptions", "Value": total_presc},
+        {"Statistic": "Unique herbs", "Value": unique_herbs},
+        {"Statistic": "Total herb occurrences", "Value": total_herb_occurrences},
+    ]
+
+    for length in range(2, 8):
+        rows.append(
+            {
+                "Statistic": f"Prescriptions of length {length}",
+                "Value": length_counts.get(length, 0),
+            }
+        )
+
+    rows.extend(
+        [
+            {"Statistic": "Train set size", "Value": split_counts.get("train", 0)},
+            {"Statistic": "Validation set size", "Value": split_counts.get("val", 0)},
+            {"Statistic": "Test set size", "Value": split_counts.get("test", 0)},
+        ]
+    )
+
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join("results", "tables", "table_dataset_stats.csv"), index=False)
+    return df
+
+
+def build_herb_index(prescriptions: Sequence[Dict]) -> Dict[str, set]:
+    herb_to_presc: Dict[str, set] = {}
+    for presc in prescriptions:
+        pid = presc["id"]
+        for herb in presc["herbs"]:
+            herb_to_presc.setdefault(herb, set()).add(pid)
+    return herb_to_presc
+
+
+def compute_spmi_values(preprocessed: Dict) -> Tuple[Dict[Tuple[Tuple[str, ...], str], Tuple[float, int]], Dict[int, List[float]]]:
+    prescriptions = preprocessed["prescriptions"]
+    total_presc = len(prescriptions)
+    herb_to_presc = build_herb_index(prescriptions)
+
+    @lru_cache(maxsize=None)
+    def intersection_size(herb_tuple: Tuple[str, ...]) -> int:
+        if not herb_tuple:
+            return 0
+        sets = [herb_to_presc.get(h, set()) for h in herb_tuple]
+        if not all(sets):
+            return 0
+        inter = sets[0]
+        for s in sets[1:]:
+            inter = inter & s
+            if not inter:
+                break
+        return len(inter)
+
+    spmi_by_context_len: Dict[int, List[float]] = {i: [] for i in range(2, 8)}
+    combo_scores: Dict[Tuple[Tuple[str, ...], str], Tuple[float, int]] = {}
+
+    for presc in prescriptions:
+        herbs = list(dict.fromkeys(presc["herbs"]))
+        for herb in herbs:
+            context = [h for h in herbs if h != herb]
+            if not (2 <= len(context) <= 7):
+                continue
+            context_tuple = tuple(sorted(context))
+            full_tuple = tuple(sorted(context + [herb]))
+            freq_s = intersection_size(context_tuple)
+            freq_h = len(herb_to_presc.get(herb, set()))
+            freq_sh = intersection_size(full_tuple)
+            if freq_s == 0 or freq_h == 0 or freq_sh == 0:
+                continue
+            p_s = freq_s / total_presc
+            p_h = freq_h / total_presc
+            p_sh = freq_sh / total_presc
+            if p_s <= 0 or p_h <= 0 or p_sh <= 0:
+                continue
+            spmi = math.log2(p_sh / (p_s * p_h))
+            spmi_by_context_len[len(context)].append(spmi)
+            key = (context_tuple, herb)
+            if key not in combo_scores:
+                combo_scores[key] = (spmi, freq_sh)
+
+    return combo_scores, spmi_by_context_len
+
+
+def save_pmi_examples(combo_scores: Dict[Tuple[Tuple[str, ...], str], Tuple[float, int]]):
+    if not combo_scores:
+        return pd.DataFrame()
+    sorted_combos = sorted(combo_scores.items(), key=lambda kv: kv[1][0])
+    extremes = sorted_combos[:2] + sorted_combos[-2:]
+    rows = []
+    for (context, herb), (score, freq) in extremes:
+        rows.append(
+            {
+                "context_herbs": list(context),
+                "added_herb": herb,
+                "sPMI": round(score, 2),
+                "frequency": freq,
+            }
+        )
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join("results", "tables", "table_pmi_examples.csv"), index=False)
+    return df
+
+
+def plot_spmi_distribution(spmi_by_context_len: Dict[int, List[float]]):
+    plt.figure(figsize=(8, 6))
+    for size in range(2, 8):
+        values = spmi_by_context_len.get(size, [])
+        if not values:
+            continue
+        sns.kdeplot(values, label=f"|S|={size}", bw_adjust=1.2)
+    plt.xlabel("sPMI")
+    plt.ylabel("Density")
+    plt.title("sPMI Score Distribution by Context Size")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join("results", "figures", "figure_spmi_distribution.png"))
+    plt.close()
+
+
+def predict_topk_names(model: HerbMindModel, device: torch.device, context_ids: List[int], id2herb: Dict[int, str], topk: int = 3):
+    if not context_ids:
+        input_ids = torch.tensor([[model.pad_id]], dtype=torch.long, device=device)
+        mask = torch.tensor([[0.0]], dtype=torch.float, device=device)
+    else:
+        input_ids = torch.tensor([context_ids], dtype=torch.long, device=device)
+        mask = torch.tensor([[1.0] * len(context_ids)], dtype=torch.float, device=device)
+
+    with torch.no_grad():
+        logits = model(input_ids, mask)
+        probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+
+    excluded = set(context_ids)
+    ordered = np.argsort(probs)[::-1]
+    top_indices = []
+    for idx in ordered:
+        if idx in excluded:
+            continue
+        top_indices.append(idx)
+        if len(top_indices) == topk:
+            break
+    return [id2herb[i] for i in top_indices]
+
+
+def extract_attention_matrix(attn_maps: List[torch.Tensor], context_len: int) -> np.ndarray:
+    if not attn_maps:
+        return np.zeros((context_len, context_len), dtype=np.float32)
+    attn = attn_maps[-2] if len(attn_maps) >= 2 else attn_maps[-1]
+    attn_mean = attn.mean(dim=1)[0].detach().cpu().numpy()
+    return attn_mean[:context_len, :context_len]
+
+
+def accumulate_attention(
+    model: HerbMindModel,
+    device: torch.device,
+    context_ids: List[int],
+    final_len: int,
+) -> np.ndarray:
+    if not context_ids:
+        return np.zeros((final_len, final_len), dtype=np.float32)
+    input_ids = torch.tensor([context_ids], dtype=torch.long, device=device)
+    mask = torch.tensor([[1.0] * len(context_ids)], dtype=torch.float, device=device)
+    with torch.no_grad():
+        _, attn_maps = model(input_ids, mask, return_attn=True)
+    attn_matrix = extract_attention_matrix(attn_maps, len(context_ids))
+    accum = np.zeros((final_len, final_len), dtype=np.float32)
+    accum[: len(context_ids), : len(context_ids)] += attn_matrix
+    return accum
+
+
+def run_sequential_example(
+    model: HerbMindModel,
+    device: torch.device,
+    preprocessed: Dict,
+    herbs_sequence: Sequence[str],
+    table_path: str,
+    figure_path: str,
+):
+    herb2id = preprocessed["herb2id"]
+    id2herb = preprocessed["id2herb"]
+    context_ids: List[int] = []
+    rows = []
+    final_len = len(herbs_sequence)
+    attention_accum = np.zeros((final_len, final_len), dtype=np.float32)
+
+    for step, herb_name in enumerate(herbs_sequence, start=1):
+        top3 = predict_topk_names(model, device, context_ids, id2herb, topk=3)
+        rows.append({"step": step, "top3": str(top3)})
+
+        herb_id = herb2id.get(herb_name)
+        if herb_id is None:
+            continue
+        context_ids.append(herb_id)
+        attention_accum += accumulate_attention(model, device, context_ids, final_len)
+
+    pd.DataFrame(rows).to_csv(table_path, index=False)
+
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(
+        attention_accum,
+        cmap="OrRd",
+        xticklabels=herbs_sequence,
+        yticklabels=herbs_sequence,
+        annot=False,
+    )
+    plt.title("Accumulated Attention")
+    plt.xlabel("Herbs")
+    plt.ylabel("Herbs")
+    plt.tight_layout()
+    plt.savefig(figure_path)
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="HerbMind turnkey pipeline")
     parser.add_argument("--epochs", type=int, default=15)
@@ -225,6 +467,10 @@ def main():
 
     preprocessed = load_and_preprocess()
     generate_splits(preprocessed, seed=args.seed)
+    compute_dataset_stats(preprocessed)
+    combo_scores, spmi_by_context_len = compute_spmi_values(preprocessed)
+    save_pmi_examples(combo_scores)
+    plot_spmi_distribution(spmi_by_context_len)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = HerbMindModel(
@@ -274,6 +520,26 @@ def main():
     if attention_payload:
         attn, rows, cols = attention_payload
         plot_attention_heatmap(attn, rows, cols, os.path.join("results", "figures", "figure_attention_heatmap.png"))
+
+    model.eval()
+    example1 = ["숙지황", "산수유", "지골피"]
+    example2 = ["감초", "건강"]
+    run_sequential_example(
+        model,
+        device,
+        preprocessed,
+        example1,
+        os.path.join("results", "tables", "example_recommendations_1.csv"),
+        os.path.join("results", "figures", "figure_attention_matrix_1.png"),
+    )
+    run_sequential_example(
+        model,
+        device,
+        preprocessed,
+        example2,
+        os.path.join("results", "tables", "example_recommendations_2.csv"),
+        os.path.join("results", "figures", "figure_attention_matrix_2.png"),
+    )
 
     summary = {
         "created_at": datetime.utcnow().isoformat() + "Z",
