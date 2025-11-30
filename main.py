@@ -29,7 +29,10 @@ from herbmind_dataset import build_dataloaders
 from model import HerbMindModel
 from visualize import (
     plot_attention_heatmap,
+    plot_frequency_scatter,
     plot_length_heatmap,
+    plot_model_architecture,
+    plot_overview_diagram,
     plot_pmi_heatmap,
     plot_tsne_embeddings,
     set_korean_font,
@@ -231,6 +234,17 @@ def load_split_prescription_counts() -> Dict[str, int]:
     return counts
 
 
+def load_split_quiz_counts() -> Dict[str, int]:
+    quiz_counts: Dict[str, int] = {}
+    for split_name, path in [("train", TRAIN_PATH), ("val", VAL_PATH), ("test", TEST_PATH)]:
+        if not os.path.exists(path):
+            quiz_counts[split_name] = 0
+            continue
+        records = pickle.load(open(path, "rb"))
+        quiz_counts[split_name] = len(records)
+    return quiz_counts
+
+
 def compute_dataset_stats(preprocessed: Dict) -> pd.DataFrame:
     prescriptions = preprocessed["prescriptions"]
     total_presc = len(prescriptions)
@@ -241,11 +255,19 @@ def compute_dataset_stats(preprocessed: Dict) -> pd.DataFrame:
         length_counts[len(p["herbs"])] = length_counts.get(len(p["herbs"]), 0) + 1
 
     split_counts = load_split_prescription_counts()
+    quiz_counts = load_split_quiz_counts()
+
+    total_quizzes = sum(quiz_counts.values())
+    avg_length = np.mean([len(p["herbs"]) for p in prescriptions]) if prescriptions else 0
+    median_length = float(np.median([len(p["herbs"]) for p in prescriptions])) if prescriptions else 0.0
 
     rows = [
         {"Statistic": "Total prescriptions", "Value": total_presc},
         {"Statistic": "Unique herbs", "Value": unique_herbs},
         {"Statistic": "Total herb occurrences", "Value": total_herb_occurrences},
+        {"Statistic": "N-1 quizzes", "Value": total_quizzes},
+        {"Statistic": "Average prescription length", "Value": round(avg_length, 2)},
+        {"Statistic": "Median prescription length", "Value": median_length},
     ]
 
     for length in range(2, 8):
@@ -258,9 +280,12 @@ def compute_dataset_stats(preprocessed: Dict) -> pd.DataFrame:
 
     rows.extend(
         [
-            {"Statistic": "Train set size", "Value": split_counts.get("train", 0)},
-            {"Statistic": "Validation set size", "Value": split_counts.get("val", 0)},
-            {"Statistic": "Test set size", "Value": split_counts.get("test", 0)},
+            {"Statistic": "Train prescriptions", "Value": split_counts.get("train", 0)},
+            {"Statistic": "Validation prescriptions", "Value": split_counts.get("val", 0)},
+            {"Statistic": "Test prescriptions", "Value": split_counts.get("test", 0)},
+            {"Statistic": "Train quizzes", "Value": quiz_counts.get("train", 0)},
+            {"Statistic": "Validation quizzes", "Value": quiz_counts.get("val", 0)},
+            {"Statistic": "Test quizzes", "Value": quiz_counts.get("test", 0)},
         ]
     )
 
@@ -391,20 +416,25 @@ def extract_attention_matrix(attn_maps: List[torch.Tensor], context_len: int) ->
     if not attn_maps:
         return np.zeros((context_len, context_len), dtype=np.float32)
     attn = attn_maps[-2] if len(attn_maps) >= 2 else attn_maps[-1]
-    if attn.dim() == 4:
-        # Shape: (batch, heads, tgt_len, src_len) when average_attn_weights=False
-        attn_mean = attn.mean(dim=1)[0]
-    elif attn.dim() == 3:
-        # Shape: (batch, tgt_len, src_len) when attention is already head-averaged
-        attn_mean = attn[0]
-    elif attn.dim() == 2:
-        # Shape: (tgt_len, src_len) if batch/head dimensions were removed upstream
-        attn_mean = attn
-    else:
+    try:
+        if attn.dim() == 4:
+            attn_mean = attn.mean(dim=1)[0]
+        elif attn.dim() == 3:
+            attn_mean = attn[0]
+        elif attn.dim() == 2:
+            attn_mean = attn
+        else:
+            return np.zeros((context_len, context_len), dtype=np.float32)
+    except IndexError:
         return np.zeros((context_len, context_len), dtype=np.float32)
 
     attn_np = attn_mean.detach().cpu().numpy()
-    return attn_np[:context_len, :context_len]
+    attn_np = attn_np[:context_len, :context_len]
+    if attn_np.shape[0] < context_len or attn_np.shape[1] < context_len:
+        padded = np.zeros((context_len, context_len), dtype=np.float32)
+        padded[: attn_np.shape[0], : attn_np.shape[1]] = attn_np
+        return padded
+    return attn_np
 
 
 def accumulate_attention(
@@ -442,7 +472,14 @@ def run_sequential_example(
 
     for step, herb_name in enumerate(herbs_sequence, start=1):
         top3 = predict_topk_names(model, device, context_ids, id2herb, topk=3)
-        rows.append({"step": step, "top3": str(top3)})
+        rows.append(
+            {
+                "step": step,
+                "given_context": ", ".join([id2herb[cid] for cid in context_ids]),
+                "target_herb": herb_name,
+                "top3_predictions": ", ".join(top3),
+            }
+        )
 
         herb_id = herb2id.get(herb_name)
         if herb_id is None:
@@ -466,6 +503,10 @@ def run_sequential_example(
     plt.tight_layout()
     plt.savefig(figure_path)
     plt.close()
+
+
+def save_frequency_scatter(herb_df: pd.DataFrame):
+    plot_frequency_scatter(herb_df, os.path.join("results", "figures", "figure_frequency_scatter.png"))
 
 
 def main():
@@ -533,7 +574,16 @@ def main():
     pmi_matrix = compute_pmi(preprocessed)
     plot_length_heatmap(length_df, os.path.join("results", "figures", "figure_length_heatmap.png"))
     plot_tsne_embeddings(model, preprocessed["id2herb"], os.path.join("results", "figures", "figure_tsne_embeddings.png"))
-    plot_pmi_heatmap(pmi_matrix, preprocessed["id2herb"], os.path.join("results", "figures", "figure_pmi_heatmap.png"))
+    plot_pmi_heatmap(
+        pmi_matrix,
+        preprocessed["id2herb"],
+        preprocessed["herb_counts"],
+        os.path.join("results", "figures", "figure_pmi_heatmap.png"),
+        top_k=50,
+    )
+    save_frequency_scatter(herb_df)
+    plot_overview_diagram(os.path.join("results", "figures", "figure_overview_task.png"))
+    plot_model_architecture(os.path.join("results", "figures", "figure_model_architecture.png"))
 
     attention_payload = collect_attention_example(model, preprocessed, device)
     if attention_payload:
